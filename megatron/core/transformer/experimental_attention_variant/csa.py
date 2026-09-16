@@ -21,6 +21,7 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
 )
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant import dsv4_mrope
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     cp_utils,
     thd_layout_kernels,
@@ -1168,7 +1169,9 @@ class Compressor(MegatronModule):
         new_tensor[:, :ratio] = prev_data
         return new_tensor
 
-    def _forward_sbhd(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+    def _forward_sbhd(
+        self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None
+    ) -> Optional[torch.Tensor]:
         """SBHD path. ``x`` is ``(sq, b, hidden_size)``; returns
         ``(sq // ratio, b, head_dim)`` or ``None`` when ``sq < ratio``.
         """
@@ -1199,16 +1202,29 @@ class Compressor(MegatronModule):
         weights = torch.softmax(score, dim=1, dtype=torch.float32).to(kv.dtype)
         kv = (kv * weights).sum(dim=1)  # [n_compressed, b, head_dim]
         kv = self.norm(kv.to(x.dtype))
-        kv = _apply_rope(
-            kv,
-            self.head_dim - self.qk_pos_emb_head_dim,
-            self.qk_pos_emb_head_dim,
-            self.rotary_pos_emb,
-            self.config,
-            n_compressed,
-            ratio=ratio,
-            cp_group=self.pg_collection.cp,
-        )
+        if position_ids is not None:
+            positions = dsv4_mrope.compressed_positions(position_ids, ratio, n_compressed)
+            kv = dsv4_mrope.apply_rotary(
+                kv,
+                dsv4_mrope.rotary_angles(
+                    positions,
+                    self.rotary_pos_emb,
+                    self.config.mrope_section,
+                    self.config.mrope_interleaved,
+                ),
+                self.qk_pos_emb_head_dim,
+            )
+        else:
+            kv = _apply_rope(
+                kv,
+                self.head_dim - self.qk_pos_emb_head_dim,
+                self.qk_pos_emb_head_dim,
+                self.rotary_pos_emb,
+                self.config,
+                n_compressed,
+                ratio=ratio,
+                cp_group=self.pg_collection.cp,
+            )
 
         if self.rotate:
             kv = rotate_activation(kv)
@@ -1224,6 +1240,7 @@ class Compressor(MegatronModule):
         compressed_position_ids: Optional[torch.Tensor] = None,
         pre_grouped_cu_seqlens: Optional[torch.Tensor] = None,
         pre_grouped_cu_seqlens_compressed: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """THD per-segment compression — fully vectorized.
 
@@ -1381,7 +1398,26 @@ class Compressor(MegatronModule):
 
         compressed_thd = self.norm(compressed_thd.to(dtype))
 
-        if pre_grouped:
+        if position_ids is not None:
+            positions = dsv4_mrope.compressed_positions(
+                position_ids,
+                ratio,
+                total_comp,
+                cu_seqlens,
+                pre_grouped_cu_seqlens_compressed if pre_grouped else cu_seqlens_compressed,
+                compressed_group_ids if pre_grouped else None,
+            )
+            compressed_thd = dsv4_mrope.apply_rotary(
+                compressed_thd,
+                dsv4_mrope.rotary_angles(
+                    positions,
+                    self.rotary_pos_emb,
+                    self.config.mrope_section,
+                    self.config.mrope_interleaved,
+                ),
+                self.qk_pos_emb_head_dim,
+            )
+        elif pre_grouped:
             position_ids = (
                 compressed_position_ids[:total_comp]
                 if compressed_position_ids is not None
@@ -1434,7 +1470,10 @@ class Compressor(MegatronModule):
         return compressed_thd, cu_seqlens_compressed
 
     def forward(
-        self, x: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+        self,
+        x: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Union[Optional[torch.Tensor], Tuple[Optional[torch.Tensor], torch.Tensor]]:
         """Compress hidden states into a shorter KV sequence.
 
@@ -1470,9 +1509,10 @@ class Compressor(MegatronModule):
                 fixed_total_comp=_get_csa_compressed_capacity(
                     packed_seq_params, self.compress_ratio, x.shape[0]
                 ),
+                position_ids=position_ids,
             )
         else:
-            result = self._forward_sbhd(x)
+            result = self._forward_sbhd(x, position_ids=position_ids)
         nvtx_range_pop("compressor")
         return result
 
@@ -1584,7 +1624,11 @@ class CSAIndexer(MegatronModule):
         self.compressor.backward_dw()
 
     def forward_before_topk(
-        self, x: torch.Tensor, qr: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Union[
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
@@ -1635,23 +1679,37 @@ class CSAIndexer(MegatronModule):
         # (runs in FP8 under FP8 training, like the other FP8 GEMMs)
         q, _ = self.linear_wq_b(qr)
         q = q.reshape(sq, bsz, self.index_n_heads, self.index_head_dim)
-        q = _apply_rope(
-            q,
-            self.index_head_dim - self.qk_pos_emb_head_dim,
-            self.qk_pos_emb_head_dim,
-            self.rotary_pos_emb,
-            self.config,
-            rotary_seq_len=sq,
-            ratio=1,
-            cp_group=self.pg_collection.cp,
-            cu_seqlens=cu_seqlens_q,
-            max_seqlen_rope=max_seqlen_rope,
-        )
+        if position_ids is not None:
+            q = dsv4_mrope.apply_rotary(
+                q,
+                dsv4_mrope.rotary_angles(
+                    position_ids,
+                    self.rotary_pos_emb,
+                    self.config.mrope_section,
+                    self.config.mrope_interleaved,
+                ),
+                self.qk_pos_emb_head_dim,
+            )
+        else:
+            q = _apply_rope(
+                q,
+                self.index_head_dim - self.qk_pos_emb_head_dim,
+                self.qk_pos_emb_head_dim,
+                self.rotary_pos_emb,
+                self.config,
+                rotary_seq_len=sq,
+                ratio=1,
+                cp_group=self.pg_collection.cp,
+                cu_seqlens=cu_seqlens_q,
+                max_seqlen_rope=max_seqlen_rope,
+            )
         q = rotate_activation(q)
 
         # K path: own compressor. SBHD returns ``k``; THD returns the
         # 2-tuple ``(k_thd, cu_seqlens_compressed)``.
-        compressor_out = self.compressor(x, packed_seq_params=packed_seq_params)
+        compressor_out = self.compressor(
+            x, packed_seq_params=packed_seq_params, position_ids=position_ids
+        )
 
         with get_fp8_disabled_context(self.config):
             weights, _ = self.linear_weights_proj(x)  # [sq, b, n_heads]
@@ -1669,6 +1727,7 @@ class CSAIndexer(MegatronModule):
         qr: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return (index_scores, topk_indices).
 
@@ -1688,7 +1747,7 @@ class CSAIndexer(MegatronModule):
         is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if is_thd:
             q, k, weights, cu_seqlens_compressed_idx = self.forward_before_topk(
-                x, qr, packed_seq_params
+                x, qr, packed_seq_params, position_ids=position_ids
             )
             cu_seqlens_q = (
                 packed_seq_params.cu_seqlens_q_padded
@@ -1737,7 +1796,9 @@ class CSAIndexer(MegatronModule):
             nvtx_range_pop("indexer")
             return index_scores, topk_indices
 
-        q, k, weights = self.forward_before_topk(x, qr, packed_seq_params)
+        q, k, weights = self.forward_before_topk(
+            x, qr, packed_seq_params, position_ids=position_ids
+        )
         nvtx_range_push("indexer_qk_topk")
         effective_topk = min(self.index_topk, k.size(0))
         index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, effective_topk, mask)
@@ -1779,6 +1840,7 @@ class _OutputInverseRope:
         sbhd_batch_size: Optional[int] = None,
         thd_cp_global_start: Optional[int] = None,
         thd_cp_rows: Optional[int] = None,
+        explicit_position_ids: Optional[torch.Tensor] = None,
     ):
         if attn.rotary_pos_emb is None:
             raise ValueError(
@@ -1792,6 +1854,15 @@ class _OutputInverseRope:
         self.cu_seqlens_q = cu_seqlens_q
         self.max_seqlen = rope_seqlen if packed_seq else None
         self.thd_cp_global_start = thd_cp_global_start
+        self.rotary_pos_emb = attn.rotary_pos_emb
+        # Multimodal / explicit physical-row coordinates. These cannot use the
+        # scalar MLA fused out-rope path, so inverse rotation stays out-of-place
+        # via :meth:`apply` (same ownership model as the unfused reference).
+        self.explicit_position_ids = explicit_position_ids
+        if explicit_position_ids is not None:
+            self.freqs = None
+            self.fused_params = None
+            return
 
         position_ids = None
         if thd_cp_global_start is not None:
@@ -1827,6 +1898,19 @@ class _OutputInverseRope:
         Args:
             x: ``(sq, b, np, head_dim)`` for sbhd, ``(rows, np, head_dim)`` for thd.
         """
+        if self.explicit_position_ids is not None:
+            rows = x.shape[0]
+            start = 0 if self.thd_cp_global_start is None else self.thd_cp_global_start
+            row_ids = torch.arange(rows, device=self.explicit_position_ids.device) + start
+            local_positions = dsv4_mrope.select_positions(self.explicit_position_ids, row_ids)
+            angles = dsv4_mrope.rotary_angles(
+                local_positions,
+                self.rotary_pos_emb,
+                self.config.mrope_section,
+                self.config.mrope_interleaved,
+            )
+            return dsv4_mrope.apply_rotary(x, angles, self.pos_dim, inverse=True)
+
         if self.thd_cp_global_start is not None:
             if self.fused_params is not None:
                 return cp_utils.apply_thd_cp_local_rope_fused(
@@ -2198,7 +2282,7 @@ class CompressedSparseAttention(MegatronModule):
         return workspace
 
     def _build_kv_full(
-        self, kv: torch.Tensor, x: torch.Tensor
+        self, kv: torch.Tensor, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
         """Concatenate original KV with compressed KV (if applicable).
 
@@ -2208,7 +2292,7 @@ class CompressedSparseAttention(MegatronModule):
             n_compressed:  number of compressed positions (0 when unused).
         """
         if self.compressor is not None and self.compress_ratio > 1:
-            compressed_kv = self.compressor(x)
+            compressed_kv = self.compressor(x, position_ids=position_ids)
             if compressed_kv is not None:
                 kv_full = torch.cat([kv, compressed_kv], dim=0)
                 n_compressed = compressed_kv.size(0)
@@ -2233,6 +2317,7 @@ class CompressedSparseAttention(MegatronModule):
         offset: int,
         window_idxs: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams],
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """PyTorch fallback path (no fused kernels).
 
@@ -2259,7 +2344,7 @@ class CompressedSparseAttention(MegatronModule):
 
                 if self.training and torch.is_grad_enabled():
                     q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
-                        x_det, qr_det, packed_seq_params
+                        x_det, qr_det, packed_seq_params, position_ids=position_ids
                     )
                     indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
                     key_for_loss = compressed_kv.unsqueeze(2).expand(-1, -1, np, -1)
@@ -2295,7 +2380,11 @@ class CompressedSparseAttention(MegatronModule):
                         )
                 else:
                     _, topk_indices_compressed = self.indexer(
-                        x_det, qr_det, mask=causal_mask, packed_seq_params=packed_seq_params
+                        x_det,
+                        qr_det,
+                        mask=causal_mask,
+                        packed_seq_params=packed_seq_params,
+                        position_ids=position_ids,
                     )
 
                 n_valid_per_pos = positions // self.compress_ratio  # [sq, 1]
@@ -2362,6 +2451,7 @@ class CompressedSparseAttention(MegatronModule):
         window_idxs: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams],
         out_rope: Optional[OutputRopeParams] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Path C: separate indexer forward (no loss) + fused sparse attn (compact)."""
         b = query.size(1)
@@ -2370,7 +2460,7 @@ class CompressedSparseAttention(MegatronModule):
         x_det = x.detach()
         qr_det = qr.detach()
         q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
-            x_det, qr_det, packed_seq_params
+            x_det, qr_det, packed_seq_params, position_ids=position_ids
         )
         compact_workspace = self._get_bshd_compact_indexer_workspace(
             q_indexer, k_indexer, topk=self.indexer.index_topk, ratio=self.compress_ratio
@@ -2416,6 +2506,7 @@ class CompressedSparseAttention(MegatronModule):
         window_idxs: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams],
         out_rope: Optional[OutputRopeParams] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Path B: fused indexer (with loss) + fused sparse attn.
 
@@ -2428,7 +2519,7 @@ class CompressedSparseAttention(MegatronModule):
         x_det = x.detach()
         qr_det = qr.detach()
         q_indexer, k_indexer, weights_indexer = self.indexer.forward_before_topk(
-            x_det, qr_det, packed_seq_params
+            x_det, qr_det, packed_seq_params, position_ids=position_ids
         )
         nvtx_range_pop("compressed_indices")
 
@@ -2491,6 +2582,7 @@ class CompressedSparseAttention(MegatronModule):
         packed_seq_params: PackedSeqParams = None,
         boundary_hidden: Optional[torch.Tensor] = None,
         boundary_kv: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass for CompressedSparseAttention.
 
@@ -2526,10 +2618,19 @@ class CompressedSparseAttention(MegatronModule):
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if self.pg_collection.cp is not None and self.pg_collection.cp.size() > 1:
                 output = self._forward_thd_cp(
-                    query, key, x, qr, boundary_hidden, boundary_kv, packed_seq_params
+                    query,
+                    key,
+                    x,
+                    qr,
+                    boundary_hidden,
+                    boundary_kv,
+                    packed_seq_params,
+                    position_ids=position_ids,
                 )
             else:
-                output = self._forward_thd(query, key, x, qr, packed_seq_params)
+                output = self._forward_thd(
+                    query, key, x, qr, packed_seq_params, position_ids=position_ids
+                )
             self.pg_collection.cp = _orig_cp_group
             nvtx_range_pop("compressed_sparse_attn")
             return output
@@ -2537,7 +2638,9 @@ class CompressedSparseAttention(MegatronModule):
         sq, b, np, hn = query.size()
 
         kv = key.squeeze(-2)  # [sq, b, 1, v_head_dim] -> [sq, b, v_head_dim]
-        kv_full, compressed_kv, n_compressed = self._build_kv_full(kv, x)
+        kv_full, compressed_kv, n_compressed = self._build_kv_full(
+            kv, x, position_ids=position_ids
+        )
         offset = sq  # compressed indices start after original positions
         window_idxs = get_window_topk_idxs(self.window_size, b, sq, query.device)
 
@@ -2547,7 +2650,12 @@ class CompressedSparseAttention(MegatronModule):
 
         indexer_loss = None
         out_rope = _OutputInverseRope(
-            self, x.dtype, rope_seqlen=sq, packed_seq=False, sbhd_batch_size=b
+            self,
+            x.dtype,
+            rope_seqlen=sq,
+            packed_seq=False,
+            sbhd_batch_size=b,
+            explicit_position_ids=position_ids,
         )
         # Every fused path rotates in place inside its Function, which owns the
         # output buffer and un-rotates what it needs in its own backward. Only
@@ -2566,6 +2674,7 @@ class CompressedSparseAttention(MegatronModule):
                 offset,
                 window_idxs,
                 packed_seq_params,
+                position_ids=position_ids,
             )
         elif has_indexer_compressed and self.training and torch.is_grad_enabled():
             output, indexer_loss = self._forward_fused_indexer_training(
@@ -2578,6 +2687,7 @@ class CompressedSparseAttention(MegatronModule):
                 window_idxs,
                 packed_seq_params,
                 out_rope=fused_out_rope,
+                position_ids=position_ids,
             )
         elif has_indexer_compressed:
             output = self._forward_fused_indexer_inference(
@@ -2590,6 +2700,7 @@ class CompressedSparseAttention(MegatronModule):
                 window_idxs,
                 packed_seq_params,
                 out_rope=fused_out_rope,
+                position_ids=position_ids,
             )
         else:
             output = self._forward_fused_no_indexer(
@@ -2629,6 +2740,7 @@ class CompressedSparseAttention(MegatronModule):
         max_seqlen_q: int,
         max_seqlen_compressed_idx: int,
         packed_seq_params: PackedSeqParams,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """PyTorch fallback path for THD (no fused kernels).
 
@@ -2646,7 +2758,9 @@ class CompressedSparseAttention(MegatronModule):
 
                 if self.training and torch.is_grad_enabled():
                     q_indexer, k_indexer, weights_indexer, cu_seqlens_compressed_idx = (
-                        self.indexer.forward_before_topk(x_det, qr_det, packed_seq_params)
+                        self.indexer.forward_before_topk(
+                            x_det, qr_det, packed_seq_params, position_ids=position_ids
+                        )
                     )
                     if k_indexer is None:
                         raise RuntimeError(
@@ -2713,7 +2827,11 @@ class CompressedSparseAttention(MegatronModule):
                         )
                 else:
                     _, topk_indices_cmp = self.indexer(
-                        x_det, qr_det, mask=None, packed_seq_params=packed_seq_params
+                        x_det,
+                        qr_det,
+                        mask=None,
+                        packed_seq_params=packed_seq_params,
+                        position_ids=position_ids,
                     )
 
                 # Shift into per-segment full-KV index space.
@@ -2826,6 +2944,7 @@ class CompressedSparseAttention(MegatronModule):
         max_seqlen_q: int,
         max_seqlen_compressed_idx: int,
         out_rope: Optional[OutputRopeParams] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Path C (THD): separate indexer forward (no loss) + fused sparse attn (compact).
 
@@ -2835,7 +2954,9 @@ class CompressedSparseAttention(MegatronModule):
         qr_det = qr.detach()
 
         q_indexer, k_indexer, weights_indexer, cu_seqlens_compressed_idx = (
-            self.indexer.forward_before_topk(x_det, qr_det, packed_seq_params)
+            self.indexer.forward_before_topk(
+                x_det, qr_det, packed_seq_params, position_ids=position_ids
+            )
         )
         q_thd = q_indexer.squeeze(1)
         w_thd = weights_indexer.squeeze(1)
@@ -2920,6 +3041,7 @@ class CompressedSparseAttention(MegatronModule):
         compressed_kv: torch.Tensor,
         kv_full_thd: torch.Tensor,
         out_rope: Optional[OutputRopeParams] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Path B (THD): fused indexer (with loss) + fused sparse attn.
 
@@ -2935,7 +3057,9 @@ class CompressedSparseAttention(MegatronModule):
         x_det = x.detach()
         qr_det = qr.detach()
         q_indexer, k_indexer, weights_indexer, cu_seqlens_compressed_idx = (
-            self.indexer.forward_before_topk(x_det, qr_det, packed_seq_params)
+            self.indexer.forward_before_topk(
+                x_det, qr_det, packed_seq_params, position_ids=position_ids
+            )
         )
         if k_indexer is None:
             raise RuntimeError(
@@ -3034,6 +3158,7 @@ class CompressedSparseAttention(MegatronModule):
         boundary_hidden: Optional[torch.Tensor],
         boundary_kv: Optional[torch.Tensor],
         packed_seq_params: PackedSeqParams,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """THD-packed context-parallel branch.
 
@@ -3067,6 +3192,7 @@ class CompressedSparseAttention(MegatronModule):
             cu_seqlens_q=cu_seqlens,
             thd_cp_global_start=global_start,
             thd_cp_rows=l_local,
+            explicit_position_ids=position_ids,
         )
         kv_local = key.squeeze(-2).squeeze(1)
         if boundary_hidden is None or boundary_kv is None:
@@ -3163,6 +3289,7 @@ class CompressedSparseAttention(MegatronModule):
                     compressed_position_ids=compressed_position_ids,
                     pre_grouped_cu_seqlens=local_cu_seqlens,
                     pre_grouped_cu_seqlens_compressed=local_cu_seqlens_compressed,
+                    position_ids=position_ids,
                 )
                 nvtx_range_pop("dsv4_cp_indexer_k_compressor")
                 # Build this edge before the independent attention
@@ -3191,6 +3318,7 @@ class CompressedSparseAttention(MegatronModule):
                 compressed_position_ids=compressed_position_ids,
                 pre_grouped_cu_seqlens=local_cu_seqlens,
                 pre_grouped_cu_seqlens_compressed=local_cu_seqlens_compressed,
+                position_ids=position_ids,
             )
             nvtx_range_pop("dsv4_cp_attention_kv_compressor")
             if indexer is not None:
@@ -3235,7 +3363,20 @@ class CompressedSparseAttention(MegatronModule):
                     q_indexer_cp = q_indexer_cp.reshape(
                         l_local, indexer.index_n_heads, indexer.index_head_dim
                     )
-                    if self.config.apply_rope_fusion:
+                    if position_ids is not None:
+                        rows = torch.arange(l_local, device=position_ids.device) + global_start
+                        positions = dsv4_mrope.select_positions(position_ids, rows)
+                        q_indexer_cp = dsv4_mrope.apply_rotary(
+                            q_indexer_cp,
+                            dsv4_mrope.rotary_angles(
+                                positions,
+                                indexer.rotary_pos_emb,
+                                self.config.mrope_section,
+                                self.config.mrope_interleaved,
+                            ),
+                            indexer.qk_pos_emb_head_dim,
+                        )
+                    elif self.config.apply_rope_fusion:
                         rotary_pos_cos, rotary_pos_sin = indexer.rotary_pos_emb.get_cached_cos_sin(
                             max_seqlen_q, dtype=q_indexer_cp.dtype, packed_seq=True, mscale=1.0
                         )
@@ -3613,6 +3754,7 @@ class CompressedSparseAttention(MegatronModule):
         x: torch.Tensor,  # (total_q, 1, hidden_size)
         qr: torch.Tensor,  # (total_q, 1, q_lora_rank)
         packed_seq_params: PackedSeqParams,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """THD-packed branch of :meth:`forward`. See class docstring for layout.
 
@@ -3659,7 +3801,7 @@ class CompressedSparseAttention(MegatronModule):
         # ---- Step 2: per-segment compression --------------------------------
         if self.compressor is not None and self.compress_ratio > 1:
             compressed_kv, cu_seqlens_compressed = self.compressor(
-                x, packed_seq_params=packed_seq_params
+                x, packed_seq_params=packed_seq_params, position_ids=position_ids
             )
             # compressed_kv is (total_comp, 1, hn) or None
             if compressed_kv is not None:
@@ -3687,7 +3829,12 @@ class CompressedSparseAttention(MegatronModule):
 
         indexer_loss = None
         out_rope = _OutputInverseRope(
-            self, x.dtype, rope_seqlen=max_seqlen_kv, packed_seq=True, cu_seqlens_q=cu_seqlens_kv
+            self,
+            x.dtype,
+            rope_seqlen=max_seqlen_kv,
+            packed_seq=True,
+            cu_seqlens_q=cu_seqlens_kv,
+            explicit_position_ids=position_ids,
         )
         # See :meth:`forward`: every fused path rotates in place inside its
         # Function, only the unfused reference path rotates out of place.
@@ -3719,6 +3866,7 @@ class CompressedSparseAttention(MegatronModule):
                 max_seqlen_q,
                 max_seqlen_compressed_idx,
                 packed_seq_params,
+                position_ids=position_ids,
             )
         else:
             # Keep original and compressed rows in separate contiguous regions.
@@ -3743,6 +3891,7 @@ class CompressedSparseAttention(MegatronModule):
                     compressed_kv,
                     kv_full_thd,
                     out_rope=fused_out_rope,
+                    position_ids=position_ids,
                 )
             elif has_indexer:
                 output = self._forward_fused_indexer_inference_thd(
@@ -3759,6 +3908,7 @@ class CompressedSparseAttention(MegatronModule):
                     max_seqlen_q,
                     max_seqlen_compressed_idx,
                     out_rope=fused_out_rope,
+                    position_ids=position_ids,
                 )
             else:
                 output = self._forward_fused_no_indexer_thd(
