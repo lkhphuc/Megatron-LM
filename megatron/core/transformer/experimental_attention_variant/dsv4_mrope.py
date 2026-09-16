@@ -4,12 +4,21 @@
 
 Positions are physical-row aligned: [B, S] or [3, B, S], including packed
 padding. Contiguous CP receives the replicated global buffer on every rank.
-The explicit path is selected by ``mrope_section`` and always uses PyTorch
-rotation, independently of the legacy MLA fusion flag.
+The explicit path is selected by ``mrope_section``. ``apply_rope_fusion``
+selects out-of-place Triton rotation when supported, with a PyTorch fallback.
 """
+
+import warnings
 
 import torch
 from torch import Tensor
+
+from megatron.core.fusions.fused_dsv4_mrope import (
+    fused_dsv4_mrope,
+    get_fused_dsv4_mrope_unavailable_reason,
+)
+
+_FUSION_FALLBACK_WARNINGS: set[str] = set()
 
 
 def validate_positions(position_ids: Tensor, batch: int, rows: int) -> None:
@@ -90,7 +99,9 @@ def rotary_angles(position_ids: Tensor, rope, section: list[int], interleaved: b
     return (selected.float() * spectrum.to(positions.device)).transpose(0, 1)
 
 
-def apply_rotary(x: Tensor, angles: Tensor, pos_dim: int, *, inverse: bool = False) -> Tensor:
+def apply_rotary(
+    x: Tensor, angles: Tensor, pos_dim: int, *, inverse: bool = False, fused: bool = False
+) -> Tensor:
     """Rotate adjacent pairs in the positional suffix; preserve all other channels.
 
     ``x`` is SBHD, SB(D), or THD (angles batch=1); output has private storage,
@@ -98,7 +109,18 @@ def apply_rotary(x: Tensor, angles: Tensor, pos_dim: int, *, inverse: bool = Fal
     The legacy DSv4 MLA path converts adjacent stored pairs into split halves
     before rotation and restores adjacent storage afterwards. This is unrelated
     to T/H/W frequency assignment or the split-half frequency table layout.
+    Unsupported fused inputs use the differentiable PyTorch reference below.
     """
+    if fused:
+        reason = get_fused_dsv4_mrope_unavailable_reason(x, angles, pos_dim)
+        if reason is None:
+            return fused_dsv4_mrope(x, angles, pos_dim, inverse=inverse)
+        if reason not in _FUSION_FALLBACK_WARNINGS:
+            _FUSION_FALLBACK_WARNINGS.add(reason)
+            warnings.warn(
+                f"DSv4 fused mRoPE is unavailable: {reason}. Falling back to PyTorch rotary.",
+                stacklevel=2,
+            )
     if x.ndim == 3 and angles.shape[1] == 1 and x.shape[1] != 1:
         angles = angles[:, 0, None, :]
     elif x.ndim == 4:
