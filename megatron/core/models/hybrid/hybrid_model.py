@@ -644,6 +644,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             decoder_extra_block_kwargs['input_ids'] = input_ids
 
         # Run decoder.
+        if self.config.mrope_section is not None:
+            decoder_extra_block_kwargs['position_ids'] = position_ids
         decoder_output = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,

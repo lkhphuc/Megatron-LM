@@ -560,6 +560,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         packed_seq_params: Optional[PackedSeqParams],
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
+        position_ids: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         # When this wrapper is itself being CUDA-graph captured, the inner layer
         # must run as a plain forward: routing through its ``__call__`` would
@@ -582,6 +583,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 padding_mask=padding_mask,
                 input_ids=input_ids,
                 _called_from_hybrid_mhc_wrapper=True,
+                position_ids=position_ids,
             )
         else:
             # Non-transformer layers (e.g. MambaLayer; GatedDeltaNet which does
@@ -613,6 +615,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager: Optional[MHCCheckpointManager] = None,
+        position_ids: Optional[Tensor] = None,
     ) -> Optional[Tuple[Tuple[Tensor, Optional[Tensor]], Optional[Tensor], float, bool]]:
         """Return a raw TransformerLayer branch output when the wrapped layer is split.
 
@@ -645,6 +648,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
                     mhc_recompute_manager=mhc_recompute_manager,
+                    position_ids=position_ids,
                 )
             )
             output_with_bias = layer._group_offload_output_with_bias(
@@ -684,6 +688,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager=None,
+        position_ids: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update.
 
@@ -709,6 +714,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             padding_mask,
             input_ids,
             mhc_recompute_manager=mhc_recompute_manager,
+            position_ids=position_ids,
         )
 
         if fast_path_result is None:
@@ -721,6 +727,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 packed_seq_params,
                 padding_mask,
                 input_ids,
+                position_ids=position_ids,
             )
             # The inner hybrid layer already applied its own local residual/dropout, so
             # it returns `aggregated + f(aggregated)`. We feed only the function
@@ -1132,6 +1139,7 @@ class HybridStack(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
         input_ids: Optional[Tensor] = None,
+        position_ids: Optional[Tensor] = None,
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """
         Forward function of the HybridStack class.
@@ -1246,6 +1254,7 @@ class HybridStack(MegatronModule):
                     padding_mask=padding_mask,
                     input_ids=input_ids,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
+                    position_ids=position_ids,
                 )
             else:
                 grouped_tail_to_skip = None
@@ -1275,6 +1284,7 @@ class HybridStack(MegatronModule):
                                 sequence_len_offset=sequence_len_offset,
                                 packed_seq_params=packed_seq_params,
                                 padding_mask=padding_mask,
+                                position_ids=position_ids,
                             )
                             if input_ids is not None:
                                 layer_kwargs["input_ids"] = input_ids

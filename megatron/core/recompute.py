@@ -32,6 +32,7 @@ def checkpointed_forward(
     extract_layer_indices: Optional[Set[int]] = None,
     layer_offset: int = 0,
     input_ids: Optional[Tensor] = None,
+    position_ids: Optional[Tensor] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -65,6 +66,7 @@ def checkpointed_forward(
             rotary_pos_emb_local,
             rotary_pos_emb_global,
             padding_mask=None,
+            position_ids=None,
         ):
             rotary_pos_emb = (
                 (rotary_pos_emb_local, rotary_pos_emb_global)
@@ -109,6 +111,8 @@ def checkpointed_forward(
                     input_ids=input_ids,
                 )
                 with inner_quantization_context:
+                    if position_ids is not None:
+                        layer_kwargs['position_ids'] = position_ids
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)
                     elif getattr(layer, "supports_hybrid_recompute_kwargs", False):
@@ -126,6 +130,7 @@ def checkpointed_forward(
                             "attention_bias",
                             "padding_mask",
                             "input_ids",
+                            "position_ids",
                         ):
                             layer_kwargs.pop(k, None)
                         hidden_states = layer(**layer_kwargs)
@@ -142,7 +147,15 @@ def checkpointed_forward(
         nonlocal hidden_states, context
         cf = custom(start, end)
         # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
-        args = (hidden_states, attention_mask, context, context_mask, *rotary_pos_emb, padding_mask)
+        args = (
+            hidden_states,
+            attention_mask,
+            context,
+            context_mask,
+            *rotary_pos_emb,
+            padding_mask,
+            position_ids,
+        )
         if use_checkpoint:
             # Precision-aware activation checkpoint: TE under FP8/FP4,
             # tensor_parallel under BF16/FP16/FP32.
