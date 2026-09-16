@@ -20,6 +20,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant import dsv4_mrope
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
@@ -55,6 +56,8 @@ class DSv4HybridSelfAttentionSubmodules:
 
 class DSv4HybridAttention(Attention):
     """DeepSeek-v4 Hybrid Attention layer."""
+
+    supports_position_ids = True
 
     def __init__(
         self,
@@ -268,6 +271,36 @@ class DSv4HybridAttention(Attention):
             raise ValueError("DSv4 THD CP requires a contiguous CP partition.")
         self.pg_collection.cp = cp_group
 
+        explicit_positions = position_ids is not None and self.config.mrope_section is not None
+        if explicit_positions:
+            if self.config.sequence_parallel:
+                raise ValueError(
+                    "DSv4 explicit rotary positions do not yet support sequence parallelism"
+                )
+            if self.config.cuda_graph_impl != 'none':
+                raise ValueError(
+                    "DSv4 explicit rotary positions require eager execution through WP4"
+                )
+            rows = hidden_states.shape[0] * cp_size
+            dsv4_mrope.validate_positions(position_ids, hidden_states.shape[1], rows)
+            if position_ids.device != hidden_states.device:
+                raise ValueError("DSv4 positions and hidden states must be on the same device")
+            if packed_seq_params is not None:
+                if qkv_format != 'thd' or hidden_states.shape[1] != 1:
+                    raise ValueError("DSv4 explicit packed positions require THD with batch=1")
+                cu_q = packed_seq_params.cu_seqlens_q_padded
+                cu_kv = packed_seq_params.cu_seqlens_kv_padded
+                cu_q = packed_seq_params.cu_seqlens_q if cu_q is None else cu_q
+                cu_kv = packed_seq_params.cu_seqlens_kv if cu_kv is None else cu_kv
+                if cu_q is None or cu_kv is None or cu_q.shape != cu_kv.shape:
+                    raise ValueError(
+                        "DSv4 explicit positions require matching Q/KV packed metadata"
+                    )
+                torch._assert_async(
+                    (cu_q[-1] == rows) & (cu_kv == cu_q).all(),
+                    "DSv4 positions must match the full physical packed Q/KV buffer",
+                )
+
         boundary_hidden = None
         if use_thd_cp:
             boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
@@ -319,6 +352,7 @@ class DSv4HybridAttention(Attention):
                 qr=q_compressed,
                 boundary_hidden=boundary_hidden,
                 boundary_kv=boundary_kv,
+                position_ids=position_ids if explicit_positions else None,
             )
         forced_released_tensors = [query, key, value]
         if boundary_kv is not None:
@@ -508,7 +542,10 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         rotary_pos_cos = None
         rotary_pos_sin = None
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if self.config.apply_rope_fusion:
+        explicit_positions = position_ids is not None and self.config.mrope_section is not None
+        if explicit_positions:
+            rotary_pos_emb = None
+        elif self.config.apply_rope_fusion:
             # ``mscale=1.0`` strips yarn's concentration factor from the
             # cached cos/sin so the fused kernel matches the unfused
             # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
@@ -611,7 +648,43 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             cp_size = cp_group.size()
-            if self.config.apply_rope_fusion:
+            if explicit_positions:
+                dsv4_mrope.validate_positions(
+                    position_ids, hidden_states.shape[1], q.shape[0] * cp_size
+                )
+                global_start = cp_group.rank() * q.shape[0]
+                q_rows = torch.arange(q.shape[0], device=position_ids.device) + global_start
+                kv_rows = (
+                    torch.arange(kv.shape[0], device=position_ids.device)
+                    + global_start
+                    - boundary_rows
+                )
+                q_positions = dsv4_mrope.select_positions(position_ids, q_rows)
+                kv_positions = dsv4_mrope.select_positions(position_ids, kv_rows, kv_rows >= 0)
+                query = dsv4_mrope.apply_rotary(
+                    q,
+                    dsv4_mrope.rotary_angles(
+                        q_positions,
+                        self.rotary_pos_emb,
+                        self.config.mrope_section,
+                        self.config.mrope_interleaved,
+                    ),
+                    self.config.qk_pos_emb_head_dim,
+                )
+                kv = dsv4_mrope.apply_rotary(
+                    kv.unsqueeze(-2),
+                    dsv4_mrope.rotary_angles(
+                        kv_positions,
+                        self.rotary_pos_emb,
+                        self.config.mrope_section,
+                        self.config.mrope_interleaved,
+                    ),
+                    self.config.qk_pos_emb_head_dim,
+                )
+                if boundary_kv_compressed is not None:
+                    boundary_kv, kv = kv[:boundary_rows], kv[boundary_rows:]
+                key = value = kv
+            elif self.config.apply_rope_fusion:
                 if cp_size > 1 and packed_seq:
                     cp_rank = cp_group.rank()
                     # Rank r owns global rows [r * local_rows, (r + 1) * local_rows).
