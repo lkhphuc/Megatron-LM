@@ -99,6 +99,33 @@ def test_thw_assignment_inverse_and_scalar():
         dsv4_mrope.validate_positions(positions, 1, 4)
 
 
+def test_contiguous_mrope_section_assignment():
+    """Non-interleaved sections take contiguous T then H then W frequency pairs."""
+    rope = RotaryEmbedding(64, rotary_percent=1.0)
+    section = [11, 11, 10]
+    positions = torch.tensor([[[2, 5]], [[13, 17]], [[23, 31]]], device='cuda')
+    angles = dsv4_mrope.rotary_angles(positions, rope, section, interleaved=False)
+    expected = torch.empty_like(angles)
+    axis = 0
+    offset = 0
+    for pair in range(32):
+        if pair - offset >= section[axis]:
+            offset += section[axis]
+            axis += 1
+        expected[:, 0, pair] = positions[axis, 0] * rope.inv_freq[pair]
+    torch.testing.assert_close(angles, expected, atol=0, rtol=0)
+    interleaved = dsv4_mrope.rotary_angles(positions, rope, section, interleaved=True)
+    assert not torch.equal(angles, interleaved)
+    # Equal axes still match interleaved / scalar RoPE.
+    equal = positions[0].expand(3, -1, -1)
+    torch.testing.assert_close(
+        dsv4_mrope.rotary_angles(equal, rope, section, False),
+        dsv4_mrope.rotary_angles(equal, rope, section, True),
+        atol=0,
+        rtol=0,
+    )
+
+
 def test_partial_rotary_preserves_both_content_and_tail():
     rope = RotaryEmbedding(64, rotary_percent=0.5)
     positions = torch.arange(7, device='cuda').view(1, -1)
@@ -145,6 +172,62 @@ def test_compressed_first_token_packed_capacity_and_cp(ratio):
     assert torch.count_nonzero(halo[..., :2]) == 0
 
 
+def test_attention_none_position_ids_keeps_scalar_path():
+    """mrope_section with position_ids=None retains the legacy scalar rotary path."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(42)
+        config = _make_config(
+            csa_compress_ratios=[0] * 4, apply_rope_fusion=False, dsa_kernel_backend='none'
+        )
+        attn = _build_attention(config, 1, ProcessGroupCollection.use_mpu_process_groups()).cuda()
+        attn.eval()
+        x = torch.randn(16, 1, config.hidden_size, device='cuda', dtype=torch.bfloat16)
+        with torch.no_grad():
+            expected = attn(x, None)[0]
+            config.mrope_section = [6, 5, 5]
+            config.mrope_interleaved = True
+            actual = attn(x, None, position_ids=None)[0]
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_explicit_positions_reject_sequence_parallel_and_cuda_graph():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(7)
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        x = torch.randn(8, 1, 256, device='cuda', dtype=torch.bfloat16)
+        ids = torch.arange(8, device='cuda').view(1, 1, 8).expand(3, -1, -1)
+        # Mutate after construction: MLATransformerConfig forbids SP without TP>1.
+        sp_config = _make_config(
+            csa_compress_ratios=[0] * 4,
+            apply_rope_fusion=False,
+            dsa_kernel_backend='none',
+            mrope_section=[6, 5, 5],
+            mrope_interleaved=True,
+        )
+        sp_attn = _build_attention(sp_config, 1, pg).cuda().eval()
+        sp_attn.config.sequence_parallel = True
+        with pytest.raises(ValueError, match='sequence parallelism'):
+            sp_attn(x, None, position_ids=ids)
+
+        graph_config = _make_config(
+            csa_compress_ratios=[0] * 4,
+            apply_rope_fusion=False,
+            dsa_kernel_backend='none',
+            cuda_graph_impl='local',
+            mrope_section=[6, 5, 5],
+            mrope_interleaved=True,
+        )
+        graph_attn = _build_attention(graph_config, 1, pg).cuda().eval()
+        with pytest.raises(ValueError, match='eager execution'):
+            graph_attn(x, None, position_ids=ids)
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize('ratio', [0, 4, 128])
 @pytest.mark.parametrize('packed', [False, True])
 def test_attention_scalar_regression_and_multimodal_backward(ratio, packed):
@@ -180,14 +263,27 @@ def test_attention_scalar_regression_and_multimodal_backward(ratio, packed):
         ids[1] = ids[1] * 2 + 3
         ids[2] = ids[2] * 3 + 7
         x.requires_grad_(True)
-        # Explicit IDs must use the correctness path even if legacy fusion is requested.
+        eager = attn(x, None, packed_seq_params=params, position_ids=ids)[0]
+        eager_grad = torch.autograd.grad(eager.float().square().mean(), x)[0]
         config.apply_rope_fusion = True
-        with patch(
-            'megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention.fused_mla_rope_inplace',
-            side_effect=AssertionError('scalar fused kernel must not consume multimodal positions'),
+        with (
+            patch(
+                'megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention.fused_mla_rope_inplace',
+                side_effect=AssertionError(
+                    'scalar fused kernel must not consume multimodal positions'
+                ),
+            ),
+            patch.object(
+                dsv4_mrope, 'fused_dsv4_mrope', wraps=dsv4_mrope.fused_dsv4_mrope
+            ) as fused,
         ):
             output = attn(x, None, packed_seq_params=params, position_ids=ids)[0]
+        # Q, KV, and inverse output always dispatch; compressed KV adds another
+        # launch for CSA, and ratio 4 also rotates the indexer Q/KV.
+        assert fused.call_count >= (3 if ratio == 0 else 4)
+        torch.testing.assert_close(output, eager, atol=2e-2, rtol=2e-2)
         output.float().square().mean().backward()
+        torch.testing.assert_close(x.grad, eager_grad, atol=2e-3, rtol=3e-2)
         assert torch.isfinite(output).all()
         assert torch.isfinite(x.grad).all()
     finally:
@@ -195,7 +291,8 @@ def test_attention_scalar_regression_and_multimodal_backward(ratio, packed):
 
 
 @pytest.mark.parametrize('ratio', [0, 4, 128])
-def test_cp2_multimodal_matches_cp1(ratio):
+@pytest.mark.parametrize('fused', [False, True])
+def test_cp2_multimodal_matches_cp1(ratio, fused):
     if Utils.world_size != 2:
         pytest.skip('Requires exactly two ranks')
     Utils.initialize_model_parallel(
@@ -221,6 +318,7 @@ def test_cp2_multimodal_matches_cp1(ratio):
             sequence_packing_scheduler='dp_balanced',
         )
         ref_config = _make_config(**common)
+        cp_config.apply_rope_fusion = fused
         cp_attn = _build_attention(cp_config, 1, pg).cuda().eval()
         ref_attn = _build_attention(ref_config, 1, ref_pg).cuda().eval()
         ref_attn.load_state_dict(cp_attn.state_dict())
@@ -251,6 +349,53 @@ def test_cp2_multimodal_matches_cp1(ratio):
         _assert_cp_tensor_match(
             local.grad, reference.grad[start : start + local_rows], 'multimodal CP2 input grad'
         )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_cp2_rejects_zigzag_and_rank_local_positions():
+    """Contiguous CP owns a global position buffer; zigzag and rank-local ids fail."""
+    if Utils.world_size != 2:
+        pytest.skip('Requires exactly two ranks')
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=2
+    )
+    try:
+        from dataclasses import replace
+
+        model_parallel_cuda_manual_seed(11)
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        config = _make_config(
+            csa_compress_ratios=[0] * 4,
+            apply_rope_fusion=False,
+            dsa_kernel_backend='none',
+            mrope_section=[6, 5, 5],
+            mrope_interleaved=True,
+            context_parallel_size=2,
+            cp_partition_mode='contiguous',
+            sequence_packing_scheduler='dp_balanced',
+        )
+        attn = _build_attention(config, 1, pg).cuda().eval()
+        lengths = (13, 51)
+        params = _make_thd_packed_seq_params(lengths)
+        rows = sum(lengths)
+        local_rows = rows // 2
+        start = pg.cp.rank() * local_rows
+        x = torch.randn(local_rows, 1, config.hidden_size, device='cuda', dtype=torch.bfloat16)
+        global_ids = (
+            torch.cat([torch.arange(n, device='cuda') for n in lengths])
+            .view(1, 1, -1)
+            .expand(3, -1, -1)
+            .clone()
+        )
+        # Rank-local buffers are the wrong length for the global ownership contract.
+        local_ids = global_ids[..., start : start + local_rows]
+        with pytest.raises(ValueError, match='replicated global positions'):
+            attn(x, None, packed_seq_params=params, position_ids=local_ids)
+
+        zigzag = replace(params, cp_partition_mode='zigzag')
+        with pytest.raises(ValueError, match='contiguous'):
+            attn(x, None, packed_seq_params=zigzag, position_ids=global_ids)
     finally:
         Utils.destroy_model_parallel()
 
