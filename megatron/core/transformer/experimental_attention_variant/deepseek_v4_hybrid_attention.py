@@ -670,6 +670,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         self.config.mrope_interleaved,
                     ),
                     self.config.qk_pos_emb_head_dim,
+                    fused=self.config.apply_rope_fusion,
                 )
                 kv = dsv4_mrope.apply_rotary(
                     kv.unsqueeze(-2),
@@ -680,6 +681,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         self.config.mrope_interleaved,
                     ),
                     self.config.qk_pos_emb_head_dim,
+                    fused=self.config.apply_rope_fusion,
                 )
                 if boundary_kv_compressed is not None:
                     boundary_kv, kv = kv[:boundary_rows], kv[boundary_rows:]

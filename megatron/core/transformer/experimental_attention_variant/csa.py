@@ -1214,6 +1214,7 @@ class Compressor(MegatronModule):
                     self.config.mrope_interleaved,
                 ),
                 self.qk_pos_emb_head_dim,
+                fused=self.config.apply_rope_fusion,
             )
         else:
             kv = _apply_rope(
@@ -1417,6 +1418,7 @@ class Compressor(MegatronModule):
                     self.config.mrope_interleaved,
                 ),
                 self.qk_pos_emb_head_dim,
+                fused=self.config.apply_rope_fusion,
             )
         elif pre_grouped:
             position_ids = (
@@ -1690,6 +1692,7 @@ class CSAIndexer(MegatronModule):
                     self.config.mrope_interleaved,
                 ),
                 self.qk_pos_emb_head_dim,
+                fused=self.config.apply_rope_fusion,
             )
         else:
             q = _apply_rope(
@@ -1910,7 +1913,13 @@ class _OutputInverseRope:
                 self.config.mrope_section,
                 self.config.mrope_interleaved,
             )
-            return dsv4_mrope.apply_rotary(x, angles, self.pos_dim, inverse=True)
+            return dsv4_mrope.apply_rotary(
+                x,
+                angles,
+                self.pos_dim,
+                inverse=True,
+                fused=self.config.apply_rope_fusion,
+            )
 
         if self.thd_cp_global_start is not None:
             if self.fused_params is not None:
@@ -3395,6 +3404,7 @@ class CompressedSparseAttention(MegatronModule):
                                 self.config.mrope_interleaved,
                             ),
                             indexer.qk_pos_emb_head_dim,
+                            fused=self.config.apply_rope_fusion,
                         )
                     elif self.config.apply_rope_fusion:
                         rotary_pos_cos, rotary_pos_sin = indexer.rotary_pos_emb.get_cached_cos_sin(
