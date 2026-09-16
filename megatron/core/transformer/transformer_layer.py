@@ -699,6 +699,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
         *,
         inference_params: Optional[Any] = None,
+        position_ids: Optional[Tensor] = None,
     ):
         """Run input norm and self-attention, returning the raw output before BDA."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -730,6 +731,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **(
+                {"position_ids": position_ids}
+                if position_ids is not None
+                and getattr(self.self_attention, "supports_position_ids", False)
+                else {}
+            ),
         )
         nvtx_range_pop(suffix="self_attention")
 
@@ -799,6 +806,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
         *,
         inference_params: Optional[Any] = None,
+        position_ids: Optional[Tensor] = None,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -863,6 +871,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                **(
+                    {"position_ids": position_ids}
+                    if position_ids is not None
+                    and getattr(self.self_attention, "supports_position_ids", False)
+                    else {}
+                ),
             )
         nvtx_range_pop(suffix="self_attention")
 
@@ -2836,6 +2850,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        position_ids: Optional[Tensor] = None,
         **_unused_kwargs,
     ):
         """Captured input-layernorm/self-attention consumer for split mHC.
@@ -2857,6 +2872,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **(
+                {"position_ids": position_ids}
+                if position_ids is not None
+                and getattr(self.self_attention, "supports_position_ids", False)
+                else {}
+            ),
         )
         if (
             not isinstance(attention_output_with_bias, tuple)
@@ -2951,6 +2972,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
         *,
         inference_params: Optional[Any] = None,
+        position_ids: Optional[Tensor] = None,
     ):
         """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -2997,6 +3019,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **(
+                {"position_ids": position_ids}
+                if position_ids is not None
+                and getattr(self.self_attention, "supports_position_ids", False)
+                else {}
+            ),
         )
         nvtx_range_pop(suffix="self_attention")
 

@@ -33,6 +33,7 @@ def checkpointed_forward(
     input_ids_by_layout: Optional[dict[str, Tensor]] = None,
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
     packed_sequence_cp_metadata: object | None = None,
+    position_ids: Optional[Tensor] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -46,6 +47,8 @@ def checkpointed_forward(
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
         input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE layers.
+        position_ids (Tensor, optional): Replicated global rotary positions forwarded to
+            attention modules that declare ``supports_position_ids``.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -70,6 +73,7 @@ def checkpointed_forward(
             rotary_pos_emb_global,
             padding_mask=None,
             input_ids=None,
+            position_ids=None,
         ):
             rotary_pos_emb = (
                 (rotary_pos_emb_local, rotary_pos_emb_global)
@@ -133,6 +137,8 @@ def checkpointed_forward(
                         else input_ids
                     )
                 with inner_quantization_context:
+                    if position_ids is not None:
+                        layer_kwargs['position_ids'] = position_ids
                     if isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(**layer_kwargs)
                     elif getattr(layer, "supports_hybrid_recompute_kwargs", False):
@@ -158,6 +164,7 @@ def checkpointed_forward(
                             "attention_bias",
                             "padding_mask",
                             "input_ids",
+                            "position_ids",
                         ):
                             layer_kwargs.pop(k, None)
                         if (
@@ -193,6 +200,7 @@ def checkpointed_forward(
             *rotary_pos_emb,
             padding_mask,
             input_ids,
+            position_ids,
         )
         if use_checkpoint:
             hidden_states, context = precision_aware_checkpoint(

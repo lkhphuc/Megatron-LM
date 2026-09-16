@@ -583,6 +583,7 @@ class HybridStack(MegatronModule):
         padding_mask_by_layout: dict[CPLayout, Tensor | None] | None = None,
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
+        position_ids: Optional[Tensor] = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -600,6 +601,9 @@ class HybridStack(MegatronModule):
                 Defaults to None.
             input_ids (Tensor, optional): Token IDs forwarded to hash-routed
                 TransformerLayer instances. Defaults to None.
+            position_ids (Tensor, optional): Replicated global rotary positions forwarded to
+                attention modules that declare ``supports_position_ids``. Unlike ``input_ids``
+                they are not converted per CP layout. Defaults to None.
         Returns:
             Tensor: the output tensor.
         """
@@ -745,6 +749,7 @@ class HybridStack(MegatronModule):
                     input_ids=input_ids,
                     input_ids_by_layout=input_ids_by_layout,
                     padding_mask_by_layout=padding_mask_by_layout,
+                    position_ids=position_ids,
                 )
             else:
                 grouped_tail_to_skip = None
@@ -777,6 +782,10 @@ class HybridStack(MegatronModule):
                     )
 
                     if isinstance(layer, ShortcutMoEBlock):
+                        if position_ids is not None:
+                            raise NotImplementedError(
+                                "position_ids are not forwarded through ShortcutMoEBlock."
+                            )
                         if layer.moe_local_idx is None:
                             raise RuntimeError(
                                 "A registered ShortcutMoEBlock is missing its MoE physical index."
@@ -826,6 +835,7 @@ class HybridStack(MegatronModule):
                                     sequence_len_offset=sequence_len_offset,
                                     packed_seq_params=layer_packed_seq_params,
                                     padding_mask=layer_padding_mask,
+                                    position_ids=position_ids,
                                 )
                                 if input_ids is not None and self._uses_hash_routing(layer):
                                     layer_kwargs["input_ids"] = (

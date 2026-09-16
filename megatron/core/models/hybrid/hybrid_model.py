@@ -810,6 +810,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 padding_mask_by_layout[layout] = layout_mask
         cp_layout_plan = cp_batch.thd_plan if cp_batch is not None else None
 
+        # Only mRoPE models forward raw positions to the decoder (e.g. DSv4 multimodal rotary).
+        decoder_position_ids = position_ids if self.config.mrope_section is not None else None
+
         # Run decoder.
         backbone_context = (
             torch.no_grad()
@@ -828,6 +831,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
                 input_ids=hash_input_ids,
+                position_ids=decoder_position_ids,
             )
         if isinstance(decoder_output, tuple):
             hidden_states, mhc_multistream = decoder_output
