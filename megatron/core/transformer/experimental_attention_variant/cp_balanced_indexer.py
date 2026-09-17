@@ -504,8 +504,40 @@ def _ensure_pack_zigzag_ok(cu_seqlens, cp_group, cp_size, l_local, layout_cache)
         )
 
 
-def _rope_positions(q, pos_ids, cu_q, nope_dim, pos_dim, indexer, config, table_len):
-    """Apply MLA RoPE at explicit sequence-relative positions (zigzag packed rows)."""
+def _rope_positions(
+    q,
+    pos_ids,
+    cu_q,
+    nope_dim,
+    pos_dim,
+    indexer,
+    config,
+    table_len,
+    *,
+    multimodal_position_ids=None,
+    physical_rows=None,
+):
+    """Apply indexer RoPE at zigzag-packed rows.
+
+    Scalar MLA uses sequence-relative ``pos_ids``. Explicit multimodal coordinates
+    select physical packed rows from the replicated global ``position_ids`` buffer.
+    """
+    if multimodal_position_ids is not None:
+        from megatron.core.transformer.experimental_attention_variant import dsv4_mrope
+
+        rows = pos_ids.long() if physical_rows is None else physical_rows.long()
+        positions = dsv4_mrope.select_positions(multimodal_position_ids, rows)
+        return dsv4_mrope.apply_rotary(
+            q,
+            dsv4_mrope.rotary_angles(
+                positions,
+                indexer.rotary_pos_emb,
+                config.mrope_section,
+                config.mrope_interleaved,
+            ),
+            pos_dim,
+            fused=config.apply_rope_fusion,
+        )
     if config.apply_rope_fusion:
         from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 
@@ -1452,6 +1484,7 @@ def balanced_compute_cp_indexer_topk(
     graph_dynamic_packs=False,
     workspace_provider=None,
     return_softmax=False,
+    position_ids=None,
 ):
     """Balanced drop-in replacement for ``compute_cp_indexer_topk``.
 
@@ -1468,6 +1501,10 @@ def balanced_compute_cp_indexer_topk(
     a caller bypasses that routing and reaches the zigzag builders with an invalid pack.
     Synthetic zigzag scoring is always fused; only ordinary-layout degenerate calls may
     fall back to the unfused reference scorer when they exceed the fused safe-row limit.
+
+    ``position_ids``, when supplied with ``config.mrope_section``, selects explicit
+    T/H/W coordinates from the replicated global buffer using each zigzag chunk's
+    physical packed rows (``plan["gather_idx"]``).
     """
     from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils as _cu
 
@@ -1657,12 +1694,23 @@ def balanced_compute_cp_indexer_topk(
     gkv = max(1, int(max_seqlen_q) // int(ratio))
 
     @torch.no_grad()
-    def _packed_topk(qr_rows, w_rows, logical_layout, topk_layout, pos_ids, kv_rows, slot):
+    def _packed_topk(qr_rows, w_rows, logical_layout, topk_layout, pos_ids, physical_rows, kv_rows, slot):
         sz = qr_rows.shape[0]
         q = _project_selection_q(indexer.linear_wq_b, qr_rows.reshape(sz, 1, q_lora))
         q = q.reshape(sz, n_heads, head_dim)
         q = _rope_positions(
-            q, pos_ids, logical_layout[0], nope_dim, pos_dim, indexer, config, int(max_seqlen_q)
+            q,
+            pos_ids,
+            logical_layout[0],
+            nope_dim,
+            pos_dim,
+            indexer,
+            config,
+            int(max_seqlen_q),
+            multimodal_position_ids=(
+                position_ids if getattr(config, "mrope_section", None) is not None else None
+            ),
+            physical_rows=physical_rows,
         )
         q = rotate_activation(q)
         workspace = None
@@ -1813,14 +1861,29 @@ def balanced_compute_cp_indexer_topk(
 
     nvtx_range_push("BalancedIndexerScore")
     nvtx_range_push("Bal_Head")
+    gather_idx = plan["gather_idx"]
     tk_head, predict_head = _packed_topk(
-        qr_h, w_h, head_layout, head_topk_layout, plan["pos_head"], k_for_topk, "balanced_head"
+        qr_h,
+        w_h,
+        head_layout,
+        head_topk_layout,
+        plan["pos_head"],
+        gather_idx[:half],
+        k_for_topk,
+        "balanced_head",
     )
     del qr_h, w_h
     nvtx_range_pop("Bal_Head")
     nvtx_range_push("Bal_Tail")
     tk_tail, predict_tail = _packed_topk(
-        qr_t, w_t, tail_layout, tail_topk_layout, plan["pos_tail"], k_for_topk, "balanced_tail"
+        qr_t,
+        w_t,
+        tail_layout,
+        tail_topk_layout,
+        plan["pos_tail"],
+        gather_idx[half:],
+        k_for_topk,
+        "balanced_tail",
     )
     del qr_t, w_t
     nvtx_range_pop("Bal_Tail")

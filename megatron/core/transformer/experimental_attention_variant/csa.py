@@ -3935,6 +3935,7 @@ class CompressedSparseAttention(MegatronModule):
                                 and sparse_indexer_loss
                                 and indexer_loss_coeff > 0
                             ),
+                            position_ids=position_ids,
                         )
                     )
                 else:
