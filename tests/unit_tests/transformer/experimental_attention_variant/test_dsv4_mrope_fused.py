@@ -9,6 +9,7 @@ import torch
 
 from megatron.core.fusions.fused_dsv4_mrope import (
     fused_dsv4_mrope,
+    fused_dsv4_mrope_raw,
     get_fused_dsv4_mrope_unavailable_reason,
 )
 from megatron.core.transformer.experimental_attention_variant import dsv4_mrope
@@ -48,6 +49,36 @@ def test_fused_rotary_matches_reference(dtype, layout, inverse, partial):
     expected_grad = torch.autograd.grad(expected + x.square(), x, grad)[0]
     torch.testing.assert_close(actual_grad, expected_grad, atol=tolerance, rtol=tolerance)
     assert torch.equal(x, before)
+
+
+@pytest.mark.parametrize('inplace', [True, False])
+def test_fused_raw_out_buffer(inplace):
+    """Raw launch writes into out= without an extra temporary+copy."""
+    x = torch.randn(11, 2, 4, 96, device='cuda')
+    angles = torch.randn(11, 2, 16, device='cuda') * 1000
+    expected = dsv4_mrope.apply_rotary(x, angles, 64)
+    if inplace:
+        actual = x.clone()
+        returned = fused_dsv4_mrope_raw(actual, angles, 64, out=actual)
+        assert returned.data_ptr() == actual.data_ptr()
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    else:
+        before = x.clone()
+        dest = torch.empty_like(x)
+        returned = fused_dsv4_mrope_raw(x, angles, 64, out=dest)
+        assert returned.data_ptr() == dest.data_ptr()
+        assert torch.equal(x, before)
+        torch.testing.assert_close(dest, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_fused_raw_out_rejects_bad_buffer():
+    x = torch.randn(7, 1, 3, 96, device='cuda')
+    angles = torch.randn(7, 1, 16, device='cuda')
+    with pytest.raises(ValueError, match='out= must match'):
+        fused_dsv4_mrope_raw(x, angles, 32, out=torch.empty(7, 2, 3, 96, device='cuda'))
+    strided = torch.randn(14, 1, 3, 96, device='cuda')[::2]
+    with pytest.raises(ValueError, match='contiguous'):
+        fused_dsv4_mrope_raw(strided.contiguous(), angles, 32, out=strided)
 
 
 @pytest.mark.parametrize('case', ['cpu', 'dtype', 'stride', 'angles_grad', 'no_triton'])
