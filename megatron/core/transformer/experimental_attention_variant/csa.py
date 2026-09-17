@@ -32,6 +32,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_co
 from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (  # pylint: disable=line-too-long
     BSHDCompactIndexerWorkspace,
     FusedCSAIndexerSparseAttnFromTopkFunc,
+    MultimodalOutputRopeParams,
     OutputRopeParams,
     THDCompactIndexerWorkspace,
     batch_of_row,
@@ -1844,6 +1845,7 @@ class _OutputInverseRope:
         thd_cp_global_start: Optional[int] = None,
         thd_cp_rows: Optional[int] = None,
         explicit_position_ids: Optional[torch.Tensor] = None,
+        local_rows: Optional[int] = None,
     ):
         if attn.rotary_pos_emb is None:
             raise ValueError(
@@ -1858,23 +1860,42 @@ class _OutputInverseRope:
         self.max_seqlen = rope_seqlen if packed_seq else None
         self.thd_cp_global_start = thd_cp_global_start
         self.rotary_pos_emb = attn.rotary_pos_emb
-        # Multimodal / explicit physical-row coordinates. These cannot use the
-        # scalar MLA fused out-rope path, so inverse rotation stays out-of-place
-        # via :meth:`apply` (same ownership model as the unfused reference).
         self.explicit_position_ids = explicit_position_ids
+        self.freqs = None
+        self.fused_params = None
         if explicit_position_ids is not None:
-            self.freqs = None
-            self.fused_params = None
+            rows = local_rows if local_rows is not None else thd_cp_rows
+            if rows is None:
+                rows = rope_seqlen
+            start = 0 if thd_cp_global_start is None else thd_cp_global_start
+            row_ids = torch.arange(rows, device=explicit_position_ids.device) + start
+            local_positions = dsv4_mrope.select_positions(explicit_position_ids, row_ids)
+            self._explicit_angles = dsv4_mrope.rotary_angles(
+                local_positions,
+                attn.rotary_pos_emb,
+                self.config.mrope_section,
+                self.config.mrope_interleaved,
+            )
+            # Mirror the scalar path: fold inverse RoPE into the fused Function
+            # whenever apply_rope_fusion is set. Multimodal uses physical-row
+            # angles rather than the MLA LUT kernel.
+            if self.config.apply_rope_fusion:
+                self.fused_params = MultimodalOutputRopeParams(
+                    angles=self._explicit_angles,
+                    nope_dim=self.nope_dim,
+                    pos_dim=self.pos_dim,
+                    fused=True,
+                    sbhd_batch_size=sbhd_batch_size,
+                )
             return
 
+        self._explicit_angles = None
         position_ids = None
         if thd_cp_global_start is not None:
             position_ids = cp_utils.thd_cp_position_ids(
                 cu_seqlens_q, thd_cp_global_start, thd_cp_rows
             )
 
-        self.freqs = None
-        self.fused_params = None
         if self.config.apply_rope_fusion:
             cos, sin = attn.rotary_pos_emb.get_cached_cos_sin(
                 rope_seqlen, dtype=dtype, packed_seq=packed_seq, mscale=1.0
@@ -1902,16 +1923,18 @@ class _OutputInverseRope:
             x: ``(sq, b, np, head_dim)`` for sbhd, ``(rows, np, head_dim)`` for thd.
         """
         if self.explicit_position_ids is not None:
-            rows = x.shape[0]
-            start = 0 if self.thd_cp_global_start is None else self.thd_cp_global_start
-            row_ids = torch.arange(rows, device=self.explicit_position_ids.device) + start
-            local_positions = dsv4_mrope.select_positions(self.explicit_position_ids, row_ids)
-            angles = dsv4_mrope.rotary_angles(
-                local_positions,
-                self.rotary_pos_emb,
-                self.config.mrope_section,
-                self.config.mrope_interleaved,
-            )
+            angles = self._explicit_angles
+            if angles is None or angles.shape[0] != x.shape[0]:
+                rows = x.shape[0]
+                start = 0 if self.thd_cp_global_start is None else self.thd_cp_global_start
+                row_ids = torch.arange(rows, device=self.explicit_position_ids.device) + start
+                local_positions = dsv4_mrope.select_positions(self.explicit_position_ids, row_ids)
+                angles = dsv4_mrope.rotary_angles(
+                    local_positions,
+                    self.rotary_pos_emb,
+                    self.config.mrope_section,
+                    self.config.mrope_interleaved,
+                )
             return dsv4_mrope.apply_rotary(
                 x,
                 angles,
@@ -2665,6 +2688,7 @@ class CompressedSparseAttention(MegatronModule):
             packed_seq=False,
             sbhd_batch_size=b,
             explicit_position_ids=position_ids,
+            local_rows=sq,
         )
         # Every fused path rotates in place inside its Function, which owns the
         # output buffer and un-rotates what it needs in its own backward. Only
@@ -3202,6 +3226,7 @@ class CompressedSparseAttention(MegatronModule):
             thd_cp_global_start=global_start,
             thd_cp_rows=l_local,
             explicit_position_ids=position_ids,
+            local_rows=l_local,
         )
         kv_local = key.squeeze(-2).squeeze(1)
         if boundary_hidden is None or boundary_kv is None:
@@ -3845,6 +3870,7 @@ class CompressedSparseAttention(MegatronModule):
             packed_seq=True,
             cu_seqlens_q=cu_seqlens_kv,
             explicit_position_ids=position_ids,
+            local_rows=total_q,
         )
         # See :meth:`forward`: every fused path rotates in place inside its
         # Function, only the unfused reference path rotates out of place.

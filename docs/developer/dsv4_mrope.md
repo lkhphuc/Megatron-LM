@@ -37,8 +37,11 @@ halves, rotates them, and restores adjacent storage with
 same adjacent-pair transform directly. This storage convention is distinct from
 `rotary_interleaved=False` (the frequency table layout) and T/H/W interleaving.
 Tests compare the exact legacy transform and its gradients in FP32/BF16/FP16.
-The attention output uses the identical local coordinates with negated angles;
-it is out of place to preserve output tensors retained by attention backward.
+The attention output uses the identical local coordinates with negated angles.
+When ``apply_rope_fusion`` is set, inverse rotation is folded into the fused
+sparse-attention Function via ``MultimodalOutputRopeParams`` (same ownership
+model as scalar ``OutputRopeParams``). Otherwise it is applied out of place
+after attention so tensors retained by attention backward stay intact.
 
 ## CSA semantics
 
@@ -60,7 +63,8 @@ visibility: a group must be complete before it becomes visible.
 The initial path is eager training/forward with SBHD or THD, CP1 or contiguous
 THD CP, ratios 0/4/128, and `rotary_interleaved=False`. Full hybrid recomputation
 propagates coordinates. `apply_rope_fusion=True` selects the DSv4 Triton rotary
-kernel for Q, shared KV, compressed/indexer KV, indexer Q, and inverse output.
+kernel for Q, shared KV, compressed/indexer KV, indexer Q, and inverse output
+(folded into the fused sparse Function via ``MultimodalOutputRopeParams``).
 Sequence parallelism and configured CUDA graphs are explicitly rejected pending
 their validation.
 CP metadata must be supplied on every pipeline stage; the pipeline activation

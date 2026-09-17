@@ -6135,6 +6135,66 @@ class TestFusedOutputInverseRope:
                 out_rope=params,
             )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("layout", ["sbhd", "thd"])
+    @pytest.mark.parametrize("fused", [False, True])
+    def test_multimodal_apply_undo_roundtrip(self, layout, fused):
+        """Multimodal angles fold into the Function with the same ownership contract."""
+        from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+        from megatron.core.transformer.experimental_attention_variant import dsv4_mrope
+
+        dev = 'cuda'
+        pos_dim = nope_dim = 64
+        head_dim = nope_dim + pos_dim
+        nheads = 4
+        section = [11, 11, 10]
+        rope = RotaryEmbedding(pos_dim, rotary_percent=1.0)
+        if layout == 'sbhd':
+            sq, b = 5, 3
+            rows, batch_size = sq * b, b
+            ids = torch.arange(sq, device=dev).view(1, 1, sq).expand(3, b, -1).contiguous()
+            ids[1] = ids[1] * 2 + 1
+            ids[2] = ids[2] * 3 + 2
+            angles = dsv4_mrope.rotary_angles(ids, rope, section, True)
+        else:
+            seg_lens = [4, 6, 5]
+            rows = sum(seg_lens)
+            batch_size = None
+            ids = torch.arange(rows, device=dev).view(1, 1, -1).expand(3, 1, -1).contiguous()
+            ids[1] = ids[1] * 2 + 1
+            ids[2] = ids[2] * 3 + 2
+            angles = dsv4_mrope.rotary_angles(ids, rope, section, True)
+
+        params = dk.MultimodalOutputRopeParams(
+            angles=angles,
+            nope_dim=nope_dim,
+            pos_dim=pos_dim,
+            fused=fused,
+            sbhd_batch_size=batch_size,
+        )
+        torch.manual_seed(9)
+        out_flat = torch.randn(rows, nheads, head_dim, dtype=torch.float32, device=dev)
+        original = out_flat.clone()
+        view = (
+            original.view(sq, b, nheads, head_dim) if layout == 'sbhd' else original
+        )
+        expected = dsv4_mrope.apply_rotary(view, angles, pos_dim, inverse=True).reshape_as(
+            out_flat
+        )
+
+        params.apply_(out_flat)
+        # Fused uses libdevice cos/sin; allow a small float32 tolerance.
+        tol = 1e-5 if fused else 0.0
+        torch.testing.assert_close(out_flat, expected, rtol=tol, atol=tol)
+
+        recovered = torch.empty_like(out_flat)
+        params.undo(out_flat, out=recovered)
+        torch.testing.assert_close(recovered, original, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(out_flat, expected, rtol=tol, atol=tol)
+
+        params.undo(out_flat)
+        torch.testing.assert_close(out_flat, original, rtol=1e-5, atol=1e-5)
+
 
 # ---------------------------------------------------------------------------
 # Public surface

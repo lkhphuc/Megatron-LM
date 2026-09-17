@@ -26,7 +26,7 @@ import logging
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -146,6 +146,82 @@ class OutputRopeParams:
             **self._kernel_kwargs(),
         )
         return t if out is None else out
+
+
+@dataclass
+class MultimodalOutputRopeParams:
+    """Explicit T/H/W inverse-RoPE folded into the fused sparse Functions.
+
+    Same ownership contract as :class:`OutputRopeParams`: :meth:`apply_` mutates
+    the Function-owned attention output, and :meth:`undo` recovers the pre-RoPE
+    ``(O, dO)`` pair for cuDNN/FlashMLA backward. Angles are physical-row
+    aligned ``[S, B, pairs]`` (THD uses ``B=1``). The Triton launch is the
+    non-autograd raw entry point so this can nest inside another Function.
+    """
+
+    angles: Tensor
+    nope_dim: int
+    pos_dim: int
+    fused: bool = False
+    sbhd_batch_size: Optional[int] = None
+
+    def _kernel_view(self, out_flat: Tensor) -> Tensor:
+        if out_flat.shape[-1] != self.nope_dim + self.pos_dim:
+            raise ValueError(
+                "Output inverse-RoPE expects head_dim == nope_dim + pos_dim, got "
+                f"{out_flat.shape[-1]} != {self.nope_dim} + {self.pos_dim}."
+            )
+        if self.sbhd_batch_size is None:
+            return out_flat
+        rows, nheads, head_dim = out_flat.shape
+        return out_flat.view(rows // self.sbhd_batch_size, self.sbhd_batch_size, nheads, head_dim)
+
+    def _rotate(self, view: Tensor, *, inverse: bool, out: Optional[Tensor] = None) -> Tensor:
+        from megatron.core.fusions.fused_dsv4_mrope import (
+            fused_dsv4_mrope_raw,
+            get_fused_dsv4_mrope_unavailable_reason,
+        )
+        from megatron.core.transformer.experimental_attention_variant import dsv4_mrope
+
+        if self.fused:
+            reason = get_fused_dsv4_mrope_unavailable_reason(view, self.angles, self.pos_dim)
+            if reason is None:
+                return fused_dsv4_mrope_raw(
+                    view, self.angles, self.pos_dim, inverse=inverse, out=out
+                )
+        rotated = dsv4_mrope.apply_rotary(
+            view, self.angles, self.pos_dim, inverse=inverse, fused=False
+        )
+        if out is None:
+            return rotated
+        out.copy_(rotated.reshape_as(out))
+        return out
+
+    def apply_(self, out_flat: Tensor) -> Tensor:
+        """Inverse-RoPE a ``(rows, heads, head_dim)`` attention output in place."""
+        view = self._kernel_view(out_flat)
+        # Contiguous views rotate in place; strided ones fall back to temp+copy.
+        dest = view if view.is_contiguous() else None
+        rotated = self._rotate(view, inverse=True, out=dest)
+        if dest is None:
+            out_flat.copy_(rotated.reshape_as(out_flat))
+        return out_flat
+
+    def undo(self, t: Tensor, out: Optional[Tensor] = None) -> Tensor:
+        """Recover the pre-RoPE values of ``t``, in place or into ``out``."""
+        view = self._kernel_view(t)
+        if out is None:
+            dest = view if view.is_contiguous() else None
+            recovered = self._rotate(view, inverse=False, out=dest)
+            if dest is None:
+                t.copy_(recovered.reshape_as(t))
+            return t
+        out_view = self._kernel_view(out)
+        dest = out_view if out_view.is_contiguous() else None
+        recovered = self._rotate(view, inverse=False, out=dest)
+        if dest is None:
+            out.copy_(recovered.reshape_as(out))
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -841,7 +917,9 @@ def _csa_fwd_flash_mla(
 
 
 def _undo_output_rope_for_backward(
-    out_rope: Optional[OutputRopeParams], out_flat: Tensor, dO_flat: Tensor
+    out_rope: Optional[Union[OutputRopeParams, MultimodalOutputRopeParams]],
+    out_flat: Tensor,
+    dO_flat: Tensor,
 ) -> Tuple[Tensor, Tensor]:
     """Recover the pre-RoPE ``(O, dO)`` pair that the cuDNN backward expects.
 
@@ -3761,6 +3839,7 @@ def fused_csa_indexer_sparse_attn(
 
 __all__ = [
     "BSHDCompactIndexerWorkspace",
+    "MultimodalOutputRopeParams",
     "OutputRopeParams",
     "THDCompactIndexerWorkspace",
     "batch_of_row",
