@@ -353,6 +353,69 @@ def test_cp2_multimodal_matches_cp1(ratio, fused):
         Utils.destroy_model_parallel()
 
 
+def test_balanced_indexer_rope_uses_multimodal_physical_rows():
+    """Zigzag packed rows must select global T/H/W coords, not sequence-relative ids."""
+    from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+    from megatron.core.transformer.experimental_attention_variant import (
+        cp_balanced_indexer,
+        dsv4_mrope,
+    )
+
+    class _Cfg:
+        apply_rope_fusion = False
+        mrope_section = [11, 11, 10]
+        mrope_interleaved = True
+        rotary_interleaved = False
+
+    class _Indexer:
+        rotary_pos_emb = RotaryEmbedding(64, rotary_percent=1.0)
+
+    rows = 8
+    physical = torch.tensor([3, 5, 9, 11, 20, 22, 24, 26], device='cuda')
+    # Sequence-relative ids that would disagree with physical rows if used.
+    seq_rel = torch.arange(rows, device='cuda', dtype=torch.int32)
+    global_ids = (
+        torch.arange(32, device='cuda').view(1, 1, -1).expand(3, 1, -1).contiguous().clone()
+    )
+    global_ids[1] = global_ids[1] * 2 + 7
+    global_ids[2] = global_ids[2] * 3 + 11
+    q = torch.randn(rows, 4, 96, device='cuda', dtype=torch.bfloat16)
+    actual = cp_balanced_indexer._rope_positions(
+        q.clone(),
+        seq_rel,
+        None,
+        nope_dim=32,
+        pos_dim=64,
+        indexer=_Indexer(),
+        config=_Cfg(),
+        table_len=32,
+        multimodal_position_ids=global_ids,
+        physical_rows=physical,
+    )
+    expected = dsv4_mrope.apply_rotary(
+        q,
+        dsv4_mrope.rotary_angles(
+            dsv4_mrope.select_positions(global_ids, physical),
+            _Indexer.rotary_pos_emb,
+            _Cfg.mrope_section,
+            _Cfg.mrope_interleaved,
+        ),
+        64,
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    scalar = cp_balanced_indexer._rope_positions(
+        q.clone(),
+        seq_rel,
+        None,
+        nope_dim=32,
+        pos_dim=64,
+        indexer=_Indexer(),
+        config=_Cfg(),
+        table_len=32,
+    )
+    assert not torch.equal(actual, scalar)
+
+
 def test_cp2_rejects_zigzag_and_rank_local_positions():
     """Contiguous CP owns a global position buffer; zigzag and rank-local ids fail."""
     if Utils.world_size != 2:
