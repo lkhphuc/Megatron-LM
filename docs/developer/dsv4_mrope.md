@@ -60,16 +60,21 @@ visibility: a group must be complete before it becomes visible.
 
 ## Supported surface and validation
 
-The initial path is eager training/forward with SBHD or THD, CP1 or contiguous
-THD CP, ratios 0/4/128, and `rotary_interleaved=False`. Full hybrid recomputation
-propagates coordinates. `apply_rope_fusion=True` selects the DSv4 Triton rotary
-kernel for Q, shared KV, compressed/indexer KV, indexer Q, and inverse output
-(folded into the fused sparse Function via ``MultimodalOutputRopeParams``).
-Sequence parallelism and configured CUDA graphs are explicitly rejected pending
-their validation.
+The initial path is eager training/forward with SBHD or THD at **CP1**.
+Contiguous THD CP and ``dsa_cp_balance_indexer`` load-balanced indexer scoring
+(including multimodal physical-row RoPE via ``gather_idx``) are implemented in
+tree but **not product-validated** for Falcon (Falcon CP was already unproven
+before mRoPE). Ratios 0/4/128 and `rotary_interleaved=False` are covered at CP1.
+Full hybrid recomputation propagates coordinates. `apply_rope_fusion=True`
+selects the DSv4 Triton rotary kernel for Q, shared KV, compressed/indexer KV,
+indexer Q, and inverse output (folded into the fused sparse Function via
+``MultimodalOutputRopeParams``). The raw fused entry point accepts an optional
+contiguous ``out=`` buffer (inplace when ``out is x``) so Function-owned inverse
+avoids an extra temporary. Sequence parallelism and configured CUDA graphs are
+explicitly rejected pending their validation.
 CP metadata must be supplied on every pipeline stage; the pipeline activation
-transport does not communicate it automatically. MTP position shifting and Falcon
-position construction/integration remain later work.
+transport does not communicate it automatically. MTP position shifting remains
+later work.
 
 Focused test entry point:
 
@@ -91,9 +96,13 @@ cosine and tensor similarity gates (>0.999), separately from scalar parity.
 shape `[physical_rows, batch, frequency_pairs]`. Coordinate selection and
 RoPE/YaRN spectrum construction are shared with the reference implementation.
 The kernel rotates adjacent stored pairs starting at `head_dim - pos_dim`,
-copies the content prefix and any unrotated tail, and always returns private
-storage. Backward applies the transpose rotation into another private tensor;
-attention output saved for backward is never mutated.
+copies the content prefix and any unrotated tail, and by default returns private
+storage. `fused_dsv4_mrope_raw(..., out=)` writes into a contiguous destination
+(including inplace when `out is x`) for nesting inside other
+`autograd.Function`s. Autograd backward still applies the transpose rotation
+into private storage; attention output saved for backward is never mutated
+except through the Function-owned `MultimodalOutputRopeParams` / `OutputRopeParams`
+path.
 
 The existing general fused mRoPE kernel rotates split halves at the front of
 each head, and the scalar MLA kernel uses an in-place scalar frequency LUT.
