@@ -1,10 +1,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Out-of-place DSv4 adjacent-pair rotary with physical-row-aligned angles.
+"""DSv4 adjacent-pair rotary with physical-row-aligned angles.
 
 Unlike the scalar MLA LUT kernel, this kernel accepts independent angles for
 every physical row and batch item. CP halos, packed padding, and compressed
 groups are mapped by the caller before dispatch.
+
+The autograd entry point always writes into private storage. The raw entry
+point accepts an optional contiguous ``out`` buffer so callers nesting inside
+another ``autograd.Function`` can rotate in place or into a preallocated
+destination without an extra temporary.
 """
 
 import os
@@ -116,16 +121,42 @@ def _rotary_kernel(
     tl.store(Y + row * D + d, result, d < D)
 
 
-def _launch(x: Tensor, angles: Tensor, pos_dim: int, inverse: bool) -> Tensor:
-    # Normalize views only; the kernel accepts noncontiguous row/head strides.
+def _normalize_view(x: Tensor, angles: Tensor) -> Tensor:
+    """Map SBHD / SBD / THD inputs onto the kernel's 4-D row layout."""
     if x.ndim == 4:
-        view = x
-    elif angles.shape[1] == 1:
-        view = x.unsqueeze(1)  # THD, including a single-head S1D tensor.
-    else:
-        view = x.unsqueeze(2)  # SBD shared KV.
+        return x
+    if angles.shape[1] == 1:
+        return x.unsqueeze(1)  # THD, including a single-head S1D tensor.
+    return x.unsqueeze(2)  # SBD shared KV.
+
+
+def _launch(
+    x: Tensor, angles: Tensor, pos_dim: int, inverse: bool, out: Tensor | None = None
+) -> Tensor:
+    # Reads accept noncontiguous row/head strides; stores are dense ``row * D``.
+    view = _normalize_view(x, angles)
     s, b, h, d = view.shape
-    output = torch.empty(view.shape, device=x.device, dtype=x.dtype)
+    if out is None:
+        output = torch.empty(view.shape, device=x.device, dtype=x.dtype)
+    else:
+        if out.shape != x.shape or out.dtype != x.dtype or out.device != x.device:
+            raise ValueError(
+                "fused DSv4 rotary out= must match input shape/dtype/device, got "
+                f"out={tuple(out.shape)}/{out.dtype}/{out.device} vs "
+                f"x={tuple(x.shape)}/{x.dtype}/{x.device}"
+            )
+        output = _normalize_view(out, angles)
+        if output.shape != view.shape:
+            raise ValueError(
+                "fused DSv4 rotary out= view must match input view shape, got "
+                f"{tuple(output.shape)} vs {tuple(view.shape)}"
+            )
+        # Dense stores require contiguous destination storage. Inplace into a
+        # strided input would also be wrong because Y uses ``row * D``.
+        if not output.is_contiguous():
+            raise ValueError("fused DSv4 rotary out= requires a contiguous buffer")
+        if output.data_ptr() == view.data_ptr() and not view.is_contiguous():
+            raise ValueError("inplace fused DSv4 rotary requires a contiguous input")
     with torch.cuda.device(x.device):
         if not output.numel():
             return output.view(x.shape)
@@ -165,6 +196,25 @@ class _FusedDSv4Rotary(torch.autograd.Function):
         if grad_output.stride(-1) != 1:
             grad_output = grad_output.contiguous()
         return _launch(grad_output, angles, ctx.pos_dim, not ctx.inverse), None, None, None
+
+
+def fused_dsv4_mrope_raw(
+    x: Tensor,
+    angles: Tensor,
+    pos_dim: int,
+    *,
+    inverse: bool = False,
+    out: Tensor | None = None,
+) -> Tensor:
+    """Non-autograd launch for nesting inside other ``autograd.Function``s.
+
+    ``out`` may be ``x`` (contiguous inplace) or a distinct contiguous buffer
+    with the same shape. When omitted, a fresh contiguous tensor is allocated.
+    """
+    reason = get_fused_dsv4_mrope_unavailable_reason(x, angles, pos_dim)
+    if reason is not None:
+        raise ValueError(reason)
+    return _launch(x, angles, pos_dim, inverse, out=out)
 
 
 def fused_dsv4_mrope(x: Tensor, angles: Tensor, pos_dim: int, *, inverse: bool = False) -> Tensor:
