@@ -311,18 +311,19 @@ def test_cp2_multimodal_matches_cp1(ratio, fused):
             mrope_section=[6, 5, 5],
             mrope_interleaved=True,
         )
+        lengths = (133, 379) if ratio == 128 else (13, 51)
         cp_config = _make_config(
             **common,
             context_parallel_size=2,
             cp_partition_mode='contiguous',
             sequence_packing_scheduler='dp_balanced',
+            max_seqlen_per_dp_cp_rank=sum(lengths) // 2,
         )
         ref_config = _make_config(**common)
         cp_config.apply_rope_fusion = fused
         cp_attn = _build_attention(cp_config, 1, pg).cuda().eval()
         ref_attn = _build_attention(ref_config, 1, ref_pg).cuda().eval()
         ref_attn.load_state_dict(cp_attn.state_dict())
-        lengths = (133, 379) if ratio == 128 else (13, 51)
         params = _make_thd_packed_seq_params(lengths)
         rows = sum(lengths)
         x = torch.randn(rows, 1, cp_config.hidden_size, device='cuda', dtype=torch.bfloat16)
@@ -428,6 +429,7 @@ def test_cp2_rejects_zigzag_and_rank_local_positions():
 
         model_parallel_cuda_manual_seed(11)
         pg = ProcessGroupCollection.use_mpu_process_groups()
+        lengths = (13, 51)
         config = _make_config(
             csa_compress_ratios=[0] * 4,
             apply_rope_fusion=False,
@@ -437,9 +439,9 @@ def test_cp2_rejects_zigzag_and_rank_local_positions():
             context_parallel_size=2,
             cp_partition_mode='contiguous',
             sequence_packing_scheduler='dp_balanced',
+            max_seqlen_per_dp_cp_rank=sum(lengths) // 2,
         )
         attn = _build_attention(config, 1, pg).cuda().eval()
-        lengths = (13, 51)
         params = _make_thd_packed_seq_params(lengths)
         rows = sum(lengths)
         local_rows = rows // 2
