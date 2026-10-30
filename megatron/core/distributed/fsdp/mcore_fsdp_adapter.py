@@ -652,3 +652,8 @@ def _load_rng_state_dict(rng_state_dict):
     torch.set_rng_state(rng_state_dict['torch_rng_state'])
     torch.cuda.set_rng_state(rng_state_dict['cuda_rng_state'])
     tensor_parallel.get_cuda_rng_tracker().set_states(rng_state_dict['rng_tracker_states'])
+
+
+# Local uncommitted shim for Megatron-Bridge main pin (expects V1/V2 names).
+FullyShardedDataParallelV1 = FullyShardedDataParallel
+FullyShardedDataParallelV2 = FullyShardedDataParallel
